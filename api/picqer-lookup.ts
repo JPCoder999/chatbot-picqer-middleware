@@ -15,63 +15,25 @@
 type ShopConfig = {
   apiKey: string;
   subdomain: string;
-  label: string; // Anzeigename
+  label: string;
 };
 
 /**
  * Mapping: Shop-Code → Picqer-Credentials
- * Neue Kunden hier eintragen. Codes sind case-insensitive.
  *
- * ──── MIGRATION PLAN ────
  * Phase 1 (jetzt):  Hardcoded in SHOP_MAP
  * Phase 2 (später): Keys aus Azure Key Vault laden
- *
- * Für Azure Key Vault wird getShopConfig() async und liest:
- *   - Secret Name: "picqer-key-{code}" → apiKey
- *   - Secret Name: "picqer-subdomain-{code}" → subdomain
- *   - Secret Name: "picqer-label-{code}" → label
- *
- * import { SecretClient } from "@azure/keyvault-secrets";
- * import { DefaultAzureCredential } from "@azure/identity";
- * const vaultUrl = "https://your-vault.vault.azure.net";
- * const client = new SecretClient(vaultUrl, new DefaultAzureCredential());
- * const secret = await client.getSecret("picqer-key-qy2025");
  */
-
 const SHOP_MAP: Record<string, ShopConfig> = {
   "QY-2025": {
     apiKey: "0LtuJHYfqIxaAdaAyjC8shl5z7WPiV7DzQ8xstjPXKRwkBXP",
     subdomain: "sellship",
     label: "QYRA",
   },
-  // Weitere Kunden hier eintragen:
-  // "XX-2025": {
-  //   apiKey: "...",
-  //   subdomain: "sellship",
-  //   label: "Anderer Kunde",
-  // },
 };
 
-/**
- * Shop-Config laden – jetzt sync aus SHOP_MAP, später async aus Azure Key Vault.
- * Wenn ihr auf Azure migriert, macht diese Funktion async und ersetzt den
- * SHOP_MAP-Lookup durch einen SecretClient.getSecret() Call.
- */
 async function getShopConfig(code: string): Promise<ShopConfig | null> {
-  // Phase 1: Hardcoded lookup
   return SHOP_MAP[code] || null;
-
-  // Phase 2: Azure Key Vault (auskommentiert bis Migration)
-  // const client = new SecretClient(vaultUrl, new DefaultAzureCredential());
-  // try {
-  //   const key = await client.getSecret(`picqer-key-${code.toLowerCase()}`);
-  //   const sub = await client.getSecret(`picqer-subdomain-${code.toLowerCase()}`);
-  //   const lbl = await client.getSecret(`picqer-label-${code.toLowerCase()}`);
-  //   if (!key.value) return null;
-  //   return { apiKey: key.value, subdomain: sub.value || "sellship", label: lbl.value || code };
-  // } catch {
-  //   return null;
-  // }
 }
 
 /* ──────────────────────────── Types ─────────────────────────────────────── */
@@ -149,7 +111,7 @@ type PicqerParcel = {
   tracking_url: string;
 };
 
-const VERSION = "picqer-lookup-v1";
+const VERSION = "picqer-lookup-v2";
 
 /* ─────────────────────── Status-Übersetzungen ──────────────────────────── */
 
@@ -196,7 +158,6 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    // Shop-Code nachschlagen (Phase 2: wird async aus Azure Key Vault geladen)
     const shop = await getShopConfig(code);
     if (!shop) {
       return res.status(403).json({
@@ -216,7 +177,6 @@ export default async function handler(req: any, res: any) {
       shop
     );
 
-    // Fallback: Suche über das search-Feld (durchsucht orderid, reference, name)
     if (!orders || orders.length === 0) {
       orders = await picqerGet<PicqerOrder[]>(
         `/orders?search=${encodeURIComponent(bestellnummer)}`,
@@ -227,7 +187,6 @@ export default async function handler(req: any, res: any) {
     if (!orders || orders.length === 0) {
       return res.status(404).json({
         message: `🔍 Keine Bestellung mit der Nummer "${bestellnummer}" gefunden.\n\nBitte überprüfe die Nummer und versuche es erneut.`,
-        lookedUp: { code, bestellnummer },
         version: VERSION,
       });
     }
@@ -249,41 +208,67 @@ export default async function handler(req: any, res: any) {
             shipments.push(...plShipments);
           }
         } catch {
-          // Shipment-Endpoint nicht verfügbar – kein Problem
+          // Shipment-Endpoint nicht verfügbar
         }
       }
     }
 
-    /* ── 3) Antwort formatieren ───────────────────────────────────────── */
+    /* ── 3) Flache Response bauen ─────────────────────────────────────── */
 
-    const response = formatResponse(order, shipments, shop.label);
+    // Hauptprodukte (ohne Bundle-Teile)
+    const mainProducts = order.products?.filter((p) => !p.partof_idorder_product) || [];
+    const produkteListe = mainProducts
+      .map((p) => {
+        const cancelled = p.amount_cancelled > 0 ? ` (${p.amount_cancelled} storniert)` : "";
+        return `${p.amount}× ${p.name}${cancelled}`;
+      })
+      .join("\n");
 
-    return res.status(200).json({
-      message: response,
-      raw: {
-        order: {
-          idorder: order.idorder,
-          orderid: order.orderid,
-          reference: order.reference,
-          status: order.status,
-          deliveryname: order.deliveryname,
-          deliverycity: order.deliverycity,
-          created: order.created,
-          updated: order.updated,
-          productsCount: order.products?.filter((p) => !p.partof_idorder_product).length,
-          picklistsCount: order.picklists?.length,
-        },
-        shipments: shipments.map((s) => ({
-          provider: s.public_providername || s.provider,
-          cancelled: s.cancelled,
-          tracking: s.parcels?.map((p) => ({
-            code: p.tracking_code,
-            url: p.tracking_url,
-          })),
-        })),
-      },
+    // Erste Picklist (Hauptfall)
+    const pl = order.picklists?.[0] || null;
+
+    // Erstes aktives Shipment + Parcel
+    const activeShipment = shipments.find((s) => !s.cancelled) || null;
+    const firstParcel = activeShipment?.parcels?.[0] || null;
+
+    const response: Record<string, any> = {
+      // ── Bestellung ──
+      bestellnummer: order.reference || order.orderid,
+      picqer_orderid: order.orderid,
+      bestell_status: ORDER_STATUS[order.status] || order.status,
+      empfaenger: order.deliveryname || "",
+      plz: order.deliveryzipcode || "",
+      stadt: order.deliverycity || "",
+      land: order.deliverycountry || "",
+      email: order.emailaddress || "",
+      telefon: order.telephone || "",
+      bestellt_am: formatDate(order.created),
+      aktualisiert_am: formatDate(order.updated),
+      produkte_anzahl: mainProducts.length,
+      produkte_liste: produkteListe || "Keine Produkte",
+
+      // ── Pickliste ──
+      picklist_id: pl?.picklistid || "",
+      picklist_status: pl ? (PICKLIST_STATUS[pl.status] || pl.status) : "Noch nicht erstellt",
+      produkte_gepickt: pl?.totalpicked ?? "",
+      produkte_gesamt: pl?.totalproducts ?? "",
+      picklist_abgeschlossen: pl?.closed_at ? formatDate(pl.closed_at) : "",
+
+      // ── Versand & Tracking ──
+      versanddienstleister: activeShipment?.public_providername || activeShipment?.providername || activeShipment?.provider || "",
+      sendungsnummer: firstParcel?.tracking_code || "",
+      tracking_link: firstParcel?.tracking_url || "",
+      versendet_am: activeShipment ? formatDate(activeShipment.created) : "",
+      gewicht: activeShipment?.weight ? `${activeShipment.weight}g` : "",
+      versand_storniert: activeShipment?.cancelled ?? false,
+
+      // ── Meta ──
+      public_status_page: order.public_status_page || "",
+      message: formatMessage(order, shipments, shop.label),
       version: VERSION,
-    });
+    };
+
+    return res.status(200).json(response);
   } catch (err: any) {
     return res.status(500).json({
       error: "Interner Fehler",
@@ -293,81 +278,27 @@ export default async function handler(req: any, res: any) {
   }
 }
 
-/* ──────────────────────── Antwort formatieren ──────────────────────────── */
+/* ──────────────────── Zusammenfassende Message ─────────────────────────── */
 
-function formatResponse(
+function formatMessage(
   order: PicqerOrder,
   shipments: PicqerShipment[],
   shopLabel: string
 ): string {
-  const lines: string[] = [];
+  const status = ORDER_STATUS[order.status] || order.status;
+  const activeShipment = shipments.find((s) => !s.cancelled);
+  const parcel = activeShipment?.parcels?.[0];
 
-  const statusLabel = ORDER_STATUS[order.status] || order.status;
+  let msg = `📦 Bestellung ${order.reference || order.orderid} (${shopLabel})\n`;
+  msg += `Status: ${status}\n`;
+  msg += `Empfänger: ${order.deliveryname}, ${order.deliveryzipcode} ${order.deliverycity}`;
 
-  lines.push(`📦 **Bestellung ${order.reference || order.orderid}** (${shopLabel})`);
-  lines.push(``);
-  lines.push(`**Status:** ${statusLabel}`);
-  lines.push(`**Empfänger:** ${order.deliveryname}`);
-  lines.push(`**Ort:** ${order.deliveryzipcode} ${order.deliverycity}`);
-  lines.push(`**Erstellt:** ${formatDate(order.created)}`);
-
-  // Produkte (nur Hauptprodukte, keine Bundle-Teile)
-  const mainProducts = order.products?.filter((p) => !p.partof_idorder_product) || [];
-  if (mainProducts.length > 0) {
-    lines.push(``);
-    lines.push(`**Produkte (${mainProducts.length}):**`);
-    for (const p of mainProducts) {
-      const cancelled = p.amount_cancelled > 0 ? ` (${p.amount_cancelled} storniert)` : "";
-      lines.push(`• ${p.amount}× ${p.name}${cancelled}`);
-    }
+  if (parcel) {
+    const provider = activeShipment?.public_providername || activeShipment?.provider || "";
+    msg += `\n🚚 Versendet mit ${provider}\nSendungsnummer: ${parcel.tracking_code}`;
   }
 
-  // Pickliste
-  if (order.picklists && order.picklists.length > 0) {
-    lines.push(``);
-    lines.push(`**📋 Pickliste:**`);
-    for (const pl of order.picklists) {
-      const plStatus = PICKLIST_STATUS[pl.status] || pl.status;
-      lines.push(`• ${pl.picklistid}: ${plStatus}`);
-      lines.push(`  ${pl.totalpicked}/${pl.totalproducts} Produkte gepickt`);
-      if (pl.closed_at) {
-        lines.push(`  Abgeschlossen: ${formatDate(pl.closed_at)}`);
-      }
-    }
-  } else {
-    lines.push(``);
-    lines.push(`📋 **Pickliste:** Noch nicht erstellt`);
-  }
-
-  // Versand & Tracking
-  const activeShipments = shipments.filter((s) => !s.cancelled);
-
-  if (activeShipments.length > 0) {
-    lines.push(``);
-    lines.push(`**🚚 Versand:**`);
-    for (const s of activeShipments) {
-      const provider = s.public_providername || s.providername || s.provider;
-      lines.push(`• Versanddienstleister: **${provider}**`);
-      lines.push(`  Versendet am: ${formatDate(s.created)}`);
-
-      for (const parcel of s.parcels || []) {
-        lines.push(`  Sendungsnummer: \`${parcel.tracking_code}\``);
-        if (parcel.tracking_url) {
-          lines.push(`  🔗 [Sendung verfolgen](${parcel.tracking_url})`);
-        }
-      }
-    }
-  } else if (order.status === "completed") {
-    // Order completed aber kein Shipment gefunden – public status page als Fallback
-    lines.push(``);
-    lines.push(`**🚚 Versand:**`);
-    lines.push(`Status-Seite: ${order.public_status_page}`);
-  } else {
-    lines.push(``);
-    lines.push(`📭 **Versand:** Noch nicht versendet – Bestellung wird verarbeitet.`);
-  }
-
-  return lines.join("\n");
+  return msg;
 }
 
 /* ──────────────────────── Picqer API Helper ────────────────────────────── */
@@ -395,7 +326,7 @@ async function picqerGet<T>(endpoint: string, shop: ShopConfig): Promise<T> {
 /* ──────────────────────── Hilfsfunktionen ──────────────────────────────── */
 
 function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "–";
+  if (!dateStr) return "";
   const d = new Date(dateStr.replace(" ", "T") + "Z");
   return d.toLocaleDateString("de-DE", {
     day: "2-digit",
