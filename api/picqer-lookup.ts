@@ -177,7 +177,7 @@ const PICKLIST_STATUS_NACHRICHTEN: Record<string, string> = {
 
   // ── picklist_status = "backorder_ohne_datum" ──
   backorder_ohne_datum:
-    "Deine Bestellung wartet aktuell auf Ware vom Lieferanten. Ein genaues Verfügbarkeitsdatum liegt leider noch nicht vor. Wir informieren dich, sobald sich der Status ändert.",
+    "Deine Bestellung wartet aktuell auf Ware vom Lieferanten. Ein genaues Verfügbarkeitsdatum liegt leider noch nicht vor.",
 
   // ── picklist_status = "pausiert" ──
   pausiert:
