@@ -644,7 +644,7 @@ async function picqerGet<T>(endpoint: string, shop: ShopConfig): Promise<T> {
     method: "GET",
     headers: {
       Authorization: "Basic " + Buffer.from(shop.apiKey + ":").toString("base64"),
-      "User-Agent": "ChatlinkBot (chatlink.com)",
+      "User-Agent": "SellshipMiddleware",
       Accept: "application/json",
     },
   });
